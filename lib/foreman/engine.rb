@@ -6,12 +6,13 @@ require "tempfile"
 require "timeout"
 require "fileutils"
 require "thread"
+require "timeout"
 
 class Foreman::Engine
 
   # The signals that the engine cares about.
   #
-  HANDLED_SIGNALS = [ :TERM, :INT, :HUP ]
+  HANDLED_SIGNALS = [ :TERM, :INT, :HUP, :CHLD ]
 
   attr_reader :env
   attr_reader :options
@@ -59,8 +60,7 @@ class Foreman::Engine
     startup
     spawn_processes
     watch_for_output
-    sleep 0.1
-    watch_for_termination { terminate_gracefully }
+    kill_children
     shutdown
   end
 
@@ -106,6 +106,8 @@ class Foreman::Engine
       handle_interrupt
     when :HUP
       handle_hangup
+    when :CHLD
+      handle_chld
     else
       system "unhandled signal #{sig}"
     end
@@ -129,6 +131,13 @@ class Foreman::Engine
   #
   def handle_hangup
     puts "SIGHUP received"
+    terminate_gracefully
+  end
+
+  # Handle a CHLD signal
+  #
+  def handle_chld
+    puts "SIGCHLD received"
     terminate_gracefully
   end
 
@@ -191,24 +200,30 @@ class Foreman::Engine
         end
       end
     else
-      begin
-        Process.kill signal, *@running.keys unless @running.empty?
-      rescue Errno::ESRCH, Errno::EPERM
-      end
-    end
-  end
-
-  # Send a signal to the whole process group.
-  #
-  # @param [String] signal  The signal to send
-  #
-  def killall(signal="SIGTERM")
-    if Foreman.windows?
-      kill_children(signal)
-    else
-      begin
-        Process.kill "-#{signal}", Process.getpgrp
-      rescue Errno::ESRCH, Errno::EPERM
+      @running.clone.each do |pid, (process, index)|
+        begin
+          timeout(options[:timeout] || 4) do  # todo: escalation timeout setting
+            # start with a polite SIGTERM
+            system "sending #{signal} to #{name_for(pid)} at pid #{pid}"
+            Process.kill(signal, pid) && Process.wait(pid)
+          end
+        rescue Timeout::Error
+          begin
+            timeout(2) do
+              # escalate to SIGINT aka control-C since some foolish process may be ignoring SIGTERM
+              system "sending INT to #{name_for(pid)} at pid #{pid}"
+              Process.kill("INT", pid) && Process.wait(pid)
+            end
+          rescue Timeout::Error
+            # escalate to SIGKILL aka "kill -9" which cannot be ignored
+            system "sending KILL to #{name_for(pid)} at pid #{pid}"
+            Process.kill("KILL", pid) && Process.wait(pid)
+          end
+        end
+        output_with_mutex name_for(pid), termination_message_for($?)
+        @running.delete(pid)
+        reader = @readers.delete(pid)
+        reader.close if reader
       end
     end
   end
@@ -353,14 +368,17 @@ private
     @processes.each do |process|
       1.upto(formation[@names[process]]) do |n|
         reader, writer = create_pipe
+        reader.close_on_exec = true if reader.respond_to?(:close_on_exec)
+        writer.close_on_exec = true if writer.respond_to?(:close_on_exec)
         begin
           pid = process.run(:output => writer, :env => {
             "PORT" => port_for(process, n).to_s
           })
-          writer.puts "started with pid #{pid}"
+          writer.puts "started with pid #{pid} and fd #{reader.fileno}"
         rescue Errno::ENOENT
           writer.puts "unknown command: #{process.command}"
         end
+        writer.close
         @running[pid] = [process, n]
         @readers[pid] = reader
       end
@@ -368,47 +386,37 @@ private
   end
 
   def watch_for_output
-    Thread.new do
-      begin
-        loop do
-          io = IO.select([@selfpipe[:reader]] + @readers.values, nil, nil, 30)
+    begin
+      while @readers.length > 0
+        io = IO.select([@selfpipe[:reader]] + @readers.values, nil, nil, 30)
 
-          begin
-            @selfpipe[:reader].read_nonblock(11)
-          rescue Errno::EAGAIN, Errno::EINTR => err
-            # ignore
-          end
+        begin
+          @selfpipe[:reader].read_nonblock(11)
+        rescue Errno::EAGAIN, Errno::EINTR => err
+          # ignore
+        end
 
-          # Look for any signals that arrived and handle them
-          while sig = Thread.main[:signal_queue].shift
-            self.handle_signal(sig)
-          end
+        (io.nil? ? [] : io.first).each do |reader|
+          next if reader == @selfpipe[:reader]
 
-          (io.nil? ? [] : io.first).each do |reader|
-            next if reader == @selfpipe[:reader]
-
-            if reader.eof?
-              @readers.delete_if { |key, value| value == reader }
-            else
-              data = reader.gets
-              output_with_mutex name_for(@readers.invert[reader]), data
-            end
+          if reader.eof?
+            @readers.delete_if { |key, value| value == reader }
+            reader.close
+          else
+            data = reader.gets
+            output_with_mutex name_for(@readers.invert[reader]), data
           end
         end
-      rescue Exception => ex
-        puts ex.message
-        puts ex.backtrace
-      end
-    end
-  end
 
-  def watch_for_termination
-    pid, status = Process.wait2
-    output_with_mutex name_for(pid), termination_message_for(status)
-    @running.delete(pid)
-    yield if block_given?
-    pid
-  rescue Errno::ECHILD
+        # Look for any signals that arrived and handle them
+        while sig = Thread.main[:signal_queue].shift
+          self.handle_signal(sig)
+        end
+      end
+    rescue Exception => ex
+      puts ex.message
+      puts ex.backtrace
+    end
   end
 
   def terminate_gracefully
@@ -422,12 +430,5 @@ private
       system  "sending SIGTERM to all processes"
       kill_children "SIGTERM"
     end
-    Timeout.timeout(options[:timeout]) do
-      watch_for_termination while @running.length > 0
-    end
-  rescue Timeout::Error
-    system  "sending SIGKILL to all processes"
-    killall "SIGKILL"
   end
-
 end
