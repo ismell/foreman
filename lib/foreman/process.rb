@@ -65,8 +65,7 @@ class Foreman::Process
         Kernel.exec wrapped_command
       end
     else
-      wrapped_command = "#{Foreman.runner} -d '#{cwd}' -p -- #{command}"
-      Process.spawn env, wrapped_command, :out => output, :err => output
+      Process.spawn env, command, :out => output, :err => output, :chdir => cwd
     end
   end
 
