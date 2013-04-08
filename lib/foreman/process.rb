@@ -55,7 +55,7 @@ class Foreman::Process
       end
     elsif Foreman.jruby_18?
       require "posix/spawn"
-      wrapped_command = "#{Foreman.runner} -d '#{cwd}' -p -- #{command}"
+      wrapped_command = "exec '#{Foreman.runner}' -d '#{cwd}' -p -- #{command}"
       POSIX::Spawn.spawn env, wrapped_command, :in => input, :out => output, :err => output
     elsif Foreman.ruby_18?
       fork do
@@ -63,11 +63,12 @@ class Foreman::Process
         $stdout.reopen output
         $stderr.reopen output
         env.each { |k,v| ENV[k] = v }
-        wrapped_command = "#{Foreman.runner} -d '#{cwd}' -p -- #{command}"
+        wrapped_command = "exec '#{Foreman.runner}' -d '#{cwd}' -p -- #{command}"
         Kernel.exec wrapped_command
       end
     else
-      Process.spawn env, command, :in => input, :out => output, :err => output, :chdir => cwd
+      wrapped_command = "exec '#{Foreman.runner}' -d '#{cwd}' -p -- #{command}"
+      Process.spawn env, *wrapped_command, :in => input, :out => output, :err => output
     end
   end
 
