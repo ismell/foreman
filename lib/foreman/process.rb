@@ -47,17 +47,19 @@ class Foreman::Process
   def run(options={})
     env    = @options[:env].merge(options[:env] || {})
     output = options[:output] || $stdout
+    input  = options[:input] || $stdin
 
     if Foreman.windows?
       Dir.chdir(cwd) do
-        Process.spawn env, expanded_command(env), :out => output, :err => output
+        Process.spawn env, expanded_command(env), :in => input, :out => output, :err => output
       end
     elsif Foreman.jruby_18?
       require "posix/spawn"
       wrapped_command = "#{Foreman.runner} -d '#{cwd}' -p -- #{command}"
-      POSIX::Spawn.spawn env, wrapped_command, :out => output, :err => output
+      POSIX::Spawn.spawn env, wrapped_command, :in => input, :out => output, :err => output
     elsif Foreman.ruby_18?
       fork do
+        $stdin.reopen input
         $stdout.reopen output
         $stderr.reopen output
         env.each { |k,v| ENV[k] = v }
@@ -65,7 +67,7 @@ class Foreman::Process
         Kernel.exec wrapped_command
       end
     else
-      Process.spawn env, command, :out => output, :err => output, :chdir => cwd
+      Process.spawn env, command, :in => input, :out => output, :err => output, :chdir => cwd
     end
   end
 

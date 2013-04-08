@@ -40,10 +40,8 @@ class Foreman::Engine
     @readers   = {}
 
     # Self-pipe for deferred signal-handling (ala djb: http://cr.yp.to/docs/selfpipe.html)
-    reader, writer       = create_pipe
-    reader.close_on_exec = true if reader.respond_to?(:close_on_exec)
-    writer.close_on_exec = true if writer.respond_to?(:close_on_exec)
-    @selfpipe            = { :reader => reader, :writer => writer }
+    @selfpipe            = create_pipe
+    @inputpipe           = create_pipe
 
     # Set up a global signal queue
     # http://blog.rubybestpractices.com/posts/ewong/016-Implementing-Signal-Handlers.html
@@ -308,7 +306,11 @@ private
 ## Helpers ##########################################################
 
   def create_pipe
-    IO.method(:pipe).arity.zero? ? IO.pipe : IO.pipe("BINARY")
+    reader, writer = IO.method(:pipe).arity.zero? ? IO.pipe : IO.pipe("BINARY")
+    reader.close_on_exec = true if reader.respond_to?(:close_on_exec)
+    writer.close_on_exec = true if writer.respond_to?(:close_on_exec)
+
+    { :reader => reader, :writer => writer }
   end
 
   def name_for(pid)
@@ -358,11 +360,11 @@ private
   def spawn_processes
     @processes.each do |process|
       1.upto(formation[@names[process]]) do |n|
-        reader, writer = create_pipe
-        reader.close_on_exec = true if reader.respond_to?(:close_on_exec)
-        writer.close_on_exec = true if writer.respond_to?(:close_on_exec)
+        pipe = create_pipe
+        reader = pipe[:reader]
+        writer = pipe[:writer]
         begin
-          pid = process.run(:output => writer, :env => {
+          pid = process.run(:input => @inputpipe[:reader], :output => writer, :env => {
             "PORT" => port_for(process, n).to_s
           })
           writer.puts "started with pid #{pid} and fd #{reader.fileno}"
